@@ -87,14 +87,15 @@ class ActivationGradientStorageGPU:
         """Store activation and register gradient hook on the same device as output."""
         if layer_name not in self._storage:
             self._storage[layer_name] = {'activations': None, 'gradients': None}
-            
-        # Store activation on its original device
+        if type(output) == tuple:
+            # modification was made for vit as it has outputs that are tuples
+            output = output[0]
         self._storage[layer_name]['activations'] = output.detach()
-        
+
         # Register gradient hook
         if output.requires_grad:
-            def _store_grad(grad):
-                self._storage[layer_name]['gradients'] = grad.detach()
+            def _store_grad(grad, name=layer_name):
+                self._storage[name]['gradients'] = grad.detach()
             handle = output.register_hook(_store_grad)
             self._handles.append(handle)
 
@@ -120,22 +121,25 @@ class WinsorcamClass(nn.Module):
         auto_register_hooks: Whether to automatically register hooks on initialization (default: True).
     """
     
-    def __init__(self, model, target_layers=None, target_layer_types=(nn.Conv2d,), auto_register_hooks=True):
+    def __init__(self, model, target_layers=None, target_layer_types=(nn.Conv2d,)):
         super().__init__()
         self.model = model
         self.target_layers = target_layers  # Specific layer names
         self.target_layer_types = target_layer_types
         self.storage = ActivationGradientStorageGPU()
         self.hooks = []
-        
-        if auto_register_hooks:
-            self._register_hooks()
+        self._register_hooks()
         
     def _register_hooks(self):
         """Register forward hooks on all layers of the specified types or specific layers."""
         def forward_hook(module, input, output, name):
             self.storage.store_activation(name, output)
         
+        # if the self.target_layers contains both ln_1 and self_attent layer these need to be hooked differently
+        if self.target_layers is not None and any(name.endswith("ln_1") for name in self.target_layers) and any(name.endswith("self_attention") for name in self.target_layers):
+            pass
+
+
         if self.target_layers is not None:
             # Hook specific layers by name
             for name, module in self.model.named_modules():
@@ -156,7 +160,6 @@ class WinsorcamClass(nn.Module):
                             partial(forward_hook, name=full_name)
                         )
                     )
-            # print(f"Registered {len(self.hooks)} hooks on {self.target_layer_types}")
                 
     def _unregister_hooks(self):
         """Remove all registered hooks."""
@@ -232,7 +235,8 @@ class WinsorcamClass(nn.Module):
     def get_gradcams_and_importance(self, input_tensor, target_class, layers,
                                 gradient_aggregation_method,
                                 layer_aggregation_method, stack_relu,
-                                interpolation_mode='nearest'):
+                                interpolation_mode='nearest',
+                                cls_token_weighting=False):
         """
         Generate GradCAM heatmaps for specified layers.
         
@@ -279,10 +283,54 @@ class WinsorcamClass(nn.Module):
             act = layer_data['activations'].detach().cpu()
             grad = layer_data['gradients'].detach().cpu()
 
+            # Swin Transformer modificiation
+            if act.ndim == 4 and grad.ndim == 4:
+                # If channel-last, convert to channel-first for downstream code
+                # (generate_filter_importances expects [B, C, H, W]).
+                if act.shape[-1] == grad.shape[-1] and act.shape[-1] > act.shape[1]:
+                    act = act.permute(0, 3, 1, 2).contiguous()
+                    grad = grad.permute(0, 3, 1, 2).contiguous()
+
+            # ViT and DEIT modification
+            if act.ndim == 3 and grad.ndim == 3:
+                # act, grad: [B, T, C]
+                b, t, c = act.shape
+
+                # find how many prefix tokens
+                num_prefix_tokens = None
+                for candidate in (2, 1, 0):
+                    n_patches = t - candidate
+                    if n_patches > 0:
+                        s = int(n_patches ** 0.5)
+                        if s * s == n_patches:
+                            num_prefix_tokens = candidate
+                            break
+
+                if num_prefix_tokens is None:
+                    raise ValueError(f"Cannot infer prefix tokens from token count T={t}")
+
+                patch_act = act[:, num_prefix_tokens:, :]     # [B, N, C]
+                if cls_token_weighting:
+                    # this is the using the cls token gradient as the importance score for each patch, which was used by kiefer et al's vit gradcam paper. It may be less intuitive than using each patch token's own gradient, but it reflects the fact that the cls token aggregates information across all patches and may provide a more holistic importance score for the entire image.
+                    patch_grad = grad[:, 0, :].unsqueeze(1).expand(-1, t - num_prefix_tokens, -1)  # [B, N, C]
+                else:
+                    # This uses the gradient of each patch token as its importance score, which is more consistent with the original GradCAM intuition of weighting activations by their own gradients. 
+                    patch_grad = grad[:, num_prefix_tokens:, :]   # [B, N, C]
+                    
+                n = patch_act.shape[1]
+                spatial_dim = int(n ** 0.5)
+
+                # [B, C, H, W]
+                act = patch_act.permute(0, 2, 1).contiguous().reshape(b, c, spatial_dim, spatial_dim)
+
+                weights = patch_grad.mean(dim=1)  # [B, C]
+                grad = weights[:, :, None, None].expand(b, c, spatial_dim, spatial_dim).contiguous()
+
+            # CNN stays [B, C, H, W]
             activations.append(act)
             gradients.append(grad)
         self.storage.clear()
-        
+            
         # Check for NaN/Inf
         has_nan_inf = False
         for grad in gradients:
@@ -307,7 +355,7 @@ class WinsorcamClass(nn.Module):
         # Process layer importances
         importance_lists = self.generate_layer_importances(importance_lists, layer_aggregation_method)
         importance_tensor = torch.stack(importance_lists)
-        
+
         if stack_relu:
             importance_tensor = torch.relu(importance_tensor)
         
@@ -323,7 +371,6 @@ class WinsorcamClass(nn.Module):
                 size=input_tensor.shape[2:], 
                 mode=interpolation_mode
             ).squeeze(1)
-        
         
         return stacked_gradcam, gradcams, importance_tensor
     
@@ -392,6 +439,8 @@ class WinsorcamClass(nn.Module):
         match layer_aggregation_method:
             case 'mean':
                 importance_lists = [torch.mean(importance_list) for importance_list in importance_lists]
+            case 'absmean':
+                importance_lists = [torch.mean(torch.abs(importance_list)) for importance_list in importance_lists]
             case 'max':
                 importance_lists = [torch.max(importance_list) for importance_list in importance_lists]
             case 'min':
@@ -418,8 +467,7 @@ class WinsorcamClass(nn.Module):
                                        size=input_tensor.shape[2:], 
                                        mode=interpolation_mode).squeeze()
         self.storage.clear()
-        return stacked_gradcam, importance_tensor
-
+        return stacked_gradcam, normalized_importance
 
 
 # Wrapper function
